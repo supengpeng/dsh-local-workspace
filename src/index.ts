@@ -10,14 +10,17 @@
  * 路径安全：所有目录参数必须位于 baseDir 之内（realpath 遏制，防止 symlink 逃逸）；
  * 相对路径拒绝绝对路径与 `..` 段；上传/打包均设大小与条目上限（Config）。
  */
-import { existsSync, mkdirSync, realpathSync } from 'node:fs'
-import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { createWriteStream, existsSync, mkdirSync, realpathSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, utimes } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
-import { deflateRawSync } from 'node:zlib'
+import { basename, dirname, join, resolve, sep } from 'node:path'
+import { Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import type { Context } from 'cordis'
 import z from 'schemastery'
+import { assertNoSymlinkEscape, requireDirUnderBase, safeRel, sanitizeName } from './paths.js'
+import { collectFiles, UPLOAD_TMP_PREFIX, writeZip, type ZipSourceFile } from './zip.js'
 
 /** webServer 服务的结构化视图（完整契约见 @deepseek-ai/dsh-host-webserver）。 */
 interface WebServerService {
@@ -52,40 +55,64 @@ export const Config = z.object({
   maxFiles: z.natural().min(1).default(20000),
 })
 
+/** 上传工作区目录的实时统计（用于上传时即时限流，避免 commit 阶段才失败）。 */
+interface WorkspaceStats {
+  fileCount: number
+  totalBytes: number
+}
+
+class WorkspaceStore {
+  private readonly stats = new Map<string, WorkspaceStats>()
+
+  async get(dir: string, maxFiles: number, maxTotalBytes: number): Promise<WorkspaceStats> {
+    const cached = this.stats.get(dir)
+    if (cached) return cached
+    const files = await collectFiles(dir, maxFiles, maxTotalBytes)
+    const next = {
+      fileCount: files.length,
+      totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+    }
+    this.stats.set(dir, next)
+    return next
+  }
+
+  set(dir: string, stats: WorkspaceStats): void {
+    this.stats.set(dir, stats)
+  }
+
+  remove(dir: string): void {
+    this.stats.delete(dir)
+  }
+
+  addFile(dir: string, countDelta: number, bytesDelta: number): void {
+    const current = this.stats.get(dir)
+    if (!current) return
+    current.fileCount += countDelta
+    current.totalBytes += bytesDelta
+  }
+}
+
+/** 按 key 串行化临界区；用于同一工作区目录的写入/删除/提交互斥。 */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>()
+
+  async run<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>(resolve => { release = resolve })
+    const tail = previous.then(() => current)
+    this.tails.set(key, tail)
+    await previous.catch(() => {})
+    try {
+      return await task()
+    } finally {
+      release()
+      if (this.tails.get(key) === tail) this.tails.delete(key)
+    }
+  }
+}
+
 // ─── 工具函数 ────────────────────────────────────────────────────────────────
-
-/** 工作区名：拒绝空名、`.`/`..`、`..` 开头、路径分隔符与控制字符。 */
-function sanitizeName(raw: string): string {
-  const cleaned = raw.trim()
-  if (!cleaned || cleaned === '.' || cleaned === '..' || cleaned.startsWith('..')) {
-    throw new Error(`非法工作区名: "${raw}"`)
-  }
-  if (/[/\\]/.test(cleaned)) throw new Error(`非法工作区名（不允许路径分隔符）: "${raw}"`)
-  if (/[\u0000-\u001f]/.test(cleaned)) throw new Error(`非法工作区名（不允许控制字符）: "${raw}"`)
-  return cleaned
-}
-
-/** 相对路径：拒绝绝对路径与 `..` 段，规范化空段。 */
-function safeRel(raw: string): string {
-  if (raw.startsWith('/') || raw.startsWith('\\') || /^[A-Za-z]:/.test(raw)) {
-    throw new Error(`非法相对路径（不允许绝对路径）: "${raw}"`)
-  }
-  const segments = raw.split(/[/\\]/).filter(segment => segment !== '' && segment !== '.')
-  if (segments.includes('..')) throw new Error(`非法相对路径（不允许 .. 段）: "${raw}"`)
-  const joined = segments.join('/')
-  if (!joined || joined.length > 2048) throw new Error(`非法相对路径: "${raw}"`)
-  return joined
-}
-
-/** 目录必须存在且位于 baseReal 之内，返回其 realpath。 */
-async function requireDirUnderBase(baseReal: string, raw: string): Promise<string> {
-  if (!isAbsolute(raw)) throw new Error(`目录必须是绝对路径: "${raw}"`)
-  const real = await realpath(raw)
-  if (real !== baseReal && !real.startsWith(baseReal + sep)) {
-    throw new Error(`目录不在工作区根 ${baseReal} 之内: "${real}"`)
-  }
-  return real
-}
 
 /** 读取请求体并限制大小（超出直接拒绝）。 */
 async function readBody(req: IncomingMessage, cap: number): Promise<Buffer> {
@@ -108,133 +135,30 @@ async function readJson(req: IncomingMessage, cap = 64 * 1024): Promise<Record<s
   return parsed as Record<string, unknown>
 }
 
+/** 流式把请求体写入文件并计数；超过上限即中断。返回实际写入字节数。 */
+async function writeRequestBodyToFile(req: IncomingMessage, filePath: string, cap: number): Promise<number> {
+  let size = 0
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      const buffer = chunk as Buffer
+      size += buffer.length
+      if (size > cap) {
+        callback(new Error(`请求体超过上限 ${cap} 字节`))
+        return
+      }
+      callback(null, chunk)
+    },
+  })
+  await pipeline(req, counter, createWriteStream(filePath, { flags: 'wx' }))
+  return size
+}
+
 /** 会话 cwd（session header 的不可变 cwd；会话不存在时为 undefined）。 */
 function sessionCwd(ctx: Context, sessionId: string): string | undefined {
   const sessions = ctx.get('sessions') as
     | { get(id: string): { header: { cwd?: string } } | undefined }
     | undefined
   return sessions?.get(sessionId)?.header.cwd
-}
-
-// ─── zip 打包（最小实现：deflate + UTF-8 名 + 中央目录） ──────────────────────
-
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let n = 0; n < 256; n++) {
-    let c = n
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    table[n] = c >>> 0
-  }
-  return table
-})()
-
-function crc32(buffer: Buffer): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < buffer.length; i++) crc = CRC_TABLE[(crc ^ buffer[i])! & 0xff]! ^ (crc >>> 8)
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-function dosDateTime(date: Date): { time: number; date: number } {
-  return {
-    time: (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1),
-    date: ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
-  }
-}
-
-/** 打包一个文件列表为 zip Buffer（条目顺序即收集顺序，全部 deflate）。 */
-async function buildZip(files: readonly ZipSourceFile[]): Promise<Buffer> {
-  const parts: Buffer[] = []
-  const central: Buffer[] = []
-  let offset = 0
-  for (const file of files) {
-    const data = await readFile(file.abs)
-    const name = Buffer.from(file.rel, 'utf8')
-    const compressed = deflateRawSync(data)
-    const crc = crc32(data)
-    const { time, date } = dosDateTime(new Date(file.mtime))
-    const local = Buffer.alloc(30)
-    local.writeUInt32LE(0x04034b50, 0)
-    local.writeUInt16LE(20, 4)
-    local.writeUInt16LE(0x0800, 6) // general purpose bit 11: UTF-8 文件名
-    local.writeUInt16LE(8, 8) // method: deflate
-    local.writeUInt16LE(time, 10)
-    local.writeUInt16LE(date, 12)
-    local.writeUInt32LE(crc, 14)
-    local.writeUInt32LE(compressed.length, 18)
-    local.writeUInt32LE(data.length, 22)
-    local.writeUInt16LE(name.length, 26)
-    local.writeUInt16LE(0, 28)
-    parts.push(local, name, compressed)
-    const centralHeader = Buffer.alloc(46)
-    centralHeader.writeUInt32LE(0x02014b50, 0)
-    centralHeader.writeUInt16LE(20, 4)
-    centralHeader.writeUInt16LE(20, 6)
-    centralHeader.writeUInt16LE(0x0800, 8)
-    centralHeader.writeUInt16LE(8, 10)
-    centralHeader.writeUInt16LE(time, 12)
-    centralHeader.writeUInt16LE(date, 14)
-    centralHeader.writeUInt32LE(crc, 16)
-    centralHeader.writeUInt32LE(compressed.length, 20)
-    centralHeader.writeUInt32LE(data.length, 24)
-    centralHeader.writeUInt16LE(name.length, 28)
-    centralHeader.writeUInt16LE(0, 30)
-    centralHeader.writeUInt16LE(0, 32)
-    centralHeader.writeUInt16LE(0, 34)
-    centralHeader.writeUInt16LE(0, 36)
-    centralHeader.writeUInt32LE(0, 38)
-    centralHeader.writeUInt32LE(offset, 42)
-    central.push(centralHeader, name)
-    offset += 30 + name.length + compressed.length
-  }
-  const centralSize = central.reduce((sum, buffer) => sum + buffer.length, 0)
-  const eocd = Buffer.alloc(22)
-  eocd.writeUInt32LE(0x06054b50, 0)
-  eocd.writeUInt16LE(0, 4)
-  eocd.writeUInt16LE(0, 6)
-  eocd.writeUInt16LE(files.length, 8)
-  eocd.writeUInt16LE(files.length, 10)
-  eocd.writeUInt32LE(centralSize, 12)
-  eocd.writeUInt32LE(offset, 16)
-  eocd.writeUInt16LE(0, 20)
-  return Buffer.concat([...parts, ...central, eocd])
-}
-
-/** 一次打包/统计的文件候选。 */
-interface ZipSourceFile {
-  /** 相对目录的路径（/ 分隔）。 */
-  rel: string
-  /** 绝对路径。 */
-  abs: string
-  /** 文件大小（字节）。 */
-  size: number
-  /** 修改时间（ms）。 */
-  mtime: number
-}
-
-/** 递归收集普通文件（跳过 symlink 与非常规文件），按名称排序并受上限约束。 */
-async function collectFiles(dir: string, maxFiles: number, maxTotalBytes: number): Promise<ZipSourceFile[]> {
-  const out: ZipSourceFile[] = []
-  let total = 0
-  const walk = async (current: string, prefix: string): Promise<void> => {
-    if (out.length >= maxFiles) throw new Error(`文件数超过上限 ${maxFiles}`)
-    const entries = await readdir(current, { withFileTypes: true })
-    entries.sort((a, b) => a.name.localeCompare(b.name))
-    for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue
-      const abs = join(current, entry.name)
-      if (entry.isDirectory()) {
-        await walk(abs, prefix ? `${prefix}/${entry.name}` : entry.name)
-        continue
-      }
-      if (!entry.isFile()) continue
-      const info = await stat(abs)
-      total += info.size
-      if (total > maxTotalBytes) throw new Error(`总大小超过上限 ${maxTotalBytes} 字节`)
-      out.push({ rel: prefix ? `${prefix}/${entry.name}` : entry.name, abs, size: info.size, mtime: info.mtimeMs })
-    }
-  }
-  await walk(dir, '')
-  return out
 }
 
 // ─── 插件主体 ─────────────────────────────────────────────────────────────────
@@ -244,6 +168,8 @@ export function apply(ctx: AppContext, config: Config): void {
   const baseDir = resolve(config.baseDir || join(dshHome, 'local-workspaces'))
   mkdirSync(baseDir, { recursive: true })
   const baseReal = realpathSync(baseDir)
+  const store = new WorkspaceStore()
+  const mutex = new KeyedMutex()
 
   const API_PREFIX = '/local-workspace/api'
   ctx.effect(() => ctx.webServer.register({
@@ -267,7 +193,15 @@ export function apply(ctx: AppContext, config: Config): void {
           if (cwd !== baseReal && !cwd.startsWith(baseReal + sep)) {
             return send(200, { ok: true, isLocal: false, cwd })
           }
-          const files = await collectFiles(cwd, config.maxFiles, config.maxTotalBytes)
+          let files: ZipSourceFile[]
+          try {
+            files = await collectFiles(cwd, config.maxFiles, config.maxTotalBytes)
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+              return send(200, { ok: true, isLocal: false, cwd })
+            }
+            throw error
+          }
           return send(200, {
             ok: true,
             isLocal: true,
@@ -284,45 +218,145 @@ export function apply(ctx: AppContext, config: Config): void {
           const existed = existsSync(dir)
           await mkdir(dir, { recursive: true })
           const real = await requireDirUnderBase(baseReal, dir)
-          return send(200, { ok: true, dir: real, path: real, existed })
+          const stats = await store.get(real, config.maxFiles, config.maxTotalBytes)
+          return send(200, {
+            ok: true,
+            dir: real,
+            path: real,
+            existed,
+            fileCount: stats.fileCount,
+            totalBytes: stats.totalBytes,
+          })
         }
         if (req.method === 'POST' && pathname === '/file') {
           const dir = await requireDirUnderBase(baseReal, url.searchParams.get('dir') ?? '')
           const rel = safeRel(url.searchParams.get('rel') ?? '')
-          const content = await readBody(req, config.maxFileBytes)
           const target = join(dir, ...rel.split('/'))
-          await mkdir(dirname(target), { recursive: true })
-          await writeFile(target, content)
-          return send(200, { ok: true, size: content.length })
+          await assertNoSymlinkEscape(dir, rel)
+
+          const contentLengthHeader = req.headers['content-length']
+          if (contentLengthHeader !== undefined) {
+            const declared = Number(contentLengthHeader)
+            if (Number.isFinite(declared) && declared > config.maxFileBytes) {
+              throw new Error(`请求体超过上限 ${config.maxFileBytes} 字节`)
+            }
+          }
+
+          const tempDir = await mkdtemp(join(baseReal, UPLOAD_TMP_PREFIX))
+          const tempFile = join(tempDir, 'payload')
+          try {
+            const contentLength = await writeRequestBodyToFile(req, tempFile, config.maxFileBytes)
+            await mutex.run(dir, async () => {
+              await assertNoSymlinkEscape(dir, rel)
+              let existed = false
+              let oldSize = 0
+              try {
+                const info = await stat(target)
+                existed = true
+                oldSize = info.size
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+              }
+
+              const current = await store.get(dir, config.maxFiles, config.maxTotalBytes)
+              const newCount = current.fileCount + (existed ? 0 : 1)
+              const newBytes = current.totalBytes - oldSize + contentLength
+              if (newCount > config.maxFiles) throw new Error(`文件数超过上限 ${config.maxFiles}`)
+              if (newBytes > config.maxTotalBytes) throw new Error(`总大小超过上限 ${config.maxTotalBytes} 字节`)
+              await mkdir(dirname(target), { recursive: true })
+              await assertNoSymlinkEscape(dir, rel)
+              const mtimeRaw = url.searchParams.get('mtime')
+              if (mtimeRaw) {
+                const mtime = Number(mtimeRaw)
+                if (Number.isFinite(mtime) && mtime > 0) {
+                  await utimes(tempFile, new Date(mtime), new Date(mtime))
+                }
+              }
+              await rename(tempFile, target)
+              store.addFile(dir, existed ? 0 : 1, contentLength - oldSize)
+            })
+            return send(200, { ok: true, size: contentLength })
+          } finally {
+            await rm(tempDir, { recursive: true, force: true })
+          }
         }
         if (req.method === 'POST' && pathname === '/commit') {
           const body = await readJson(req)
           const dir = await requireDirUnderBase(baseReal, String(body.dir ?? ''))
-          const files = await collectFiles(dir, config.maxFiles, config.maxTotalBytes)
-          return send(200, {
-            ok: true,
-            path: dir,
-            fileCount: files.length,
-            totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+          return await mutex.run(dir, async () => {
+            const files = await collectFiles(dir, config.maxFiles, config.maxTotalBytes)
+            store.set(dir, {
+              fileCount: files.length,
+              totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+            })
+            return send(200, {
+              ok: true,
+              path: dir,
+              fileCount: files.length,
+              totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+            })
           })
         }
         if (req.method === 'POST' && pathname === '/remove') {
           const body = await readJson(req)
           const dir = await requireDirUnderBase(baseReal, String(body.dir ?? ''))
           if (dir === baseReal) throw new Error('不能删除工作区根目录')
-          await rm(dir, { recursive: true, force: true })
-          return send(200, { ok: true, removed: dir })
+          return await mutex.run(dir, async () => {
+            await rm(dir, { recursive: true, force: true })
+            store.remove(dir)
+            return send(200, { ok: true, removed: dir })
+          })
+        }
+        if (req.method === 'GET' && pathname === '/sync/manifest') {
+          const dir = await requireDirUnderBase(baseReal, url.searchParams.get('dir') ?? '')
+          const files = await collectFiles(dir, config.maxFiles, config.maxTotalBytes)
+          return send(200, {
+            ok: true,
+            files: files.map(file => ({ rel: file.rel, size: file.size, mtime: file.mtime })),
+          })
+        }
+        if (req.method === 'GET' && pathname === '/sync/file') {
+          const dir = await requireDirUnderBase(baseReal, url.searchParams.get('dir') ?? '')
+          const rel = safeRel(url.searchParams.get('rel') ?? '')
+          const target = join(dir, ...rel.split('/'))
+          await assertNoSymlinkEscape(dir, rel)
+          const info = await stat(target)
+          if (info.isDirectory()) throw new Error('不能下载目录')
+          const data = await readFile(target)
+          res.writeHead(200, {
+            'content-type': 'application/octet-stream',
+            'content-length': String(data.length),
+            'x-mtime': String(info.mtimeMs),
+          })
+          res.end(data)
+          return
+        }
+        if (req.method === 'POST' && pathname === '/sync/remove-file') {
+          const body = await readJson(req)
+          const dir = await requireDirUnderBase(baseReal, String(body.dir ?? ''))
+          const rel = safeRel(String(body.rel ?? ''))
+          return await mutex.run(dir, async () => {
+            const target = join(dir, ...rel.split('/'))
+            await assertNoSymlinkEscape(dir, rel)
+            try {
+              const info = await stat(target)
+              if (info.isDirectory()) throw new Error('不能删除目录')
+              await rm(target, { force: true })
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+            }
+            store.remove(dir)
+            return send(200, { ok: true, removed: rel })
+          })
         }
         if (req.method === 'GET' && pathname === '/download') {
           const dir = await requireDirUnderBase(baseReal, url.searchParams.get('dir') ?? '')
           const files = await collectFiles(dir, config.maxFiles, config.maxTotalBytes)
-          const zip = await buildZip(files)
           res.writeHead(200, {
             'content-type': 'application/zip',
             'content-disposition': `attachment; filename="${basename(dir)}.zip"`,
-            'content-length': String(zip.length),
           })
-          res.end(zip)
+          await writeZip(res, files)
           return
         }
         return send(404, { ok: false, error: `not found: ${req.method} ${pathname}` })

@@ -17,10 +17,14 @@ import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-run
 import {
   Button, IconFolderOpenOutline16, Modal,
 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { isDirectoryPickerSupported, pickDirectory, syncManager } from './sync.js'
 
 export const inject = ['slots', 'workspaces']
 
 const API = '/local-workspace/api'
+
+/** 并发上传数：平衡大文件夹速度与服务器/浏览器连接压力。 */
+const UPLOAD_CONCURRENCY = 4
 
 /** workspaces 服务的结构化视图（完整契约见 @deepseek-ai/dsh-client-runtime/client）。 */
 interface WorkspacesFace {
@@ -95,21 +99,23 @@ const postJson = (path: string, body: unknown): Promise<Record<string, unknown>>
     return data
   })
 
-/** 单个文件整体上传（XHR 提供上传进度）。 */
+/** 单个文件上传（直接发送 File/Blob，避免整体读入内存；XHR 提供上传进度）。 */
 function uploadFile(
-  dir: string, rel: string, buffer: ArrayBuffer,
-  xhrRef: React.MutableRefObject<XMLHttpRequest | null>,
+  dir: string,
+  rel: string,
+  file: Blob,
+  xhrs: Set<XMLHttpRequest>,
   onProgress: (loaded: number) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    xhrRef.current = xhr
+    xhrs.add(xhr)
     xhr.open('POST', `${API}/file?dir=${encodeURIComponent(dir)}&rel=${encodeURIComponent(rel)}`)
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) onProgress(event.loaded)
     }
     xhr.onload = () => {
-      xhrRef.current = null
+      xhrs.delete(xhr)
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve()
         return
@@ -122,15 +128,36 @@ function uploadFile(
       reject(new Error(`上传失败（${xhr.status}）${detail}`))
     }
     xhr.onerror = () => {
-      xhrRef.current = null
+      xhrs.delete(xhr)
       reject(new Error('上传网络错误'))
     }
     xhr.onabort = () => {
-      xhrRef.current = null
+      xhrs.delete(xhr)
       reject(new Error('上传已取消'))
     }
-    xhr.send(buffer)
+    xhr.send(file)
   })
+}
+
+/** 有界并发上传所有文件；每个文件完成后把进度对齐到文件实际大小。 */
+async function uploadAll(
+  dir: string,
+  files: { rel: string; file: File; size: number }[],
+  concurrency: number,
+  xhrs: Set<XMLHttpRequest>,
+  onFileProgress: (rel: string, loaded: number) => void,
+): Promise<void> {
+  let next = 0
+  const worker = async (): Promise<void> => {
+    while (next < files.length) {
+      const current = next++
+      const item = files[current]!
+      await uploadFile(dir, item.rel, item.file, xhrs, loaded => onFileProgress(item.rel, loaded))
+      onFileProgress(item.rel, item.file.size)
+    }
+  }
+  const count = Math.min(concurrency, files.length)
+  await Promise.all(Array.from({ length: count }, () => worker()))
 }
 
 // ─── 侧边栏底部入口按钮 ───────────────────────────────────────────────────────
@@ -176,7 +203,11 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
   const [message, setMessage] = React.useState('')
   const [error, setError] = React.useState('')
   const inputRef = React.useRef<HTMLInputElement | null>(null)
-  const xhrRef = React.useRef<XMLHttpRequest | null>(null)
+  const xhrsRef = React.useRef<Set<XMLHttpRequest> | null>(null)
+  if (xhrsRef.current === null) xhrsRef.current = new Set()
+  const sentByFileRef = React.useRef(new Map<string, number>())
+  const totalSentRef = React.useRef(0)
+  const syncSnapshot = React.useSyncExternalStore(syncManager.subscribe, syncManager.getSnapshot)
 
   const refresh = React.useCallback((): void => {
     fetch(`${API}/status?sessionId=${encodeURIComponent(sessionId ?? '')}`)
@@ -204,23 +235,33 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
     }
     const firstRel = list[0]?.webkitRelativePath || list[0]?.name || 'workspace'
     const name = firstRel.split('/')[0] || 'workspace'
+    const items: { rel: string; file: File; size: number }[] = []
+    const seen = new Set<string>()
+    for (const file of list) {
+      const rel = (file.webkitRelativePath || file.name).split('/').slice(1).join('/') || file.name
+      if (seen.has(rel)) {
+        setError(`重复文件路径: ${rel}`)
+        return
+      }
+      seen.add(rel)
+      items.push({ rel, file, size: file.size })
+    }
     setError('')
-    setMessage(`正在上传「${name}」（${list.length} 个文件）…`)
+    setMessage(`正在上传「${name}」（${items.length} 个文件）…`)
     setBusy(true)
     setProgress({ sent: 0, total })
+    sentByFileRef.current = new Map()
+    totalSentRef.current = 0
     try {
       const begin = await postJson('/begin', { name })
       const dir = String(begin.dir ?? '')
-      let sent = 0
-      for (const file of list) {
-        const rel = (file.webkitRelativePath || file.name).split('/').slice(1).join('/') || file.name
-        const buffer = await file.arrayBuffer()
-        await uploadFile(dir, rel, buffer, xhrRef, loaded => {
-          setProgress(previous => ({ sent: previous.sent + loaded, total }))
-        })
-        sent += file.size
-        setProgress({ sent, total })
-      }
+      await uploadAll(dir, items, UPLOAD_CONCURRENCY, xhrsRef.current!, (rel, loaded) => {
+        const previous = sentByFileRef.current.get(rel) ?? 0
+        const delta = loaded - previous
+        sentByFileRef.current.set(rel, loaded)
+        totalSentRef.current += delta
+        setProgress({ sent: totalSentRef.current, total })
+      })
       const commit = await postJson('/commit', { dir })
       setMessage('上传完成，正在创建工作区会话…')
       const created = await ctx.workspaces.create({ path: String(commit.path) })
@@ -228,6 +269,7 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
       setMessage('已切换到新工作区会话')
       setStatus(null)
     } catch (uploadError) {
+      cancel()
       setError(uploadError instanceof Error ? uploadError.message : String(uploadError))
       setMessage('')
     } finally {
@@ -236,12 +278,46 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
     }
   }
 
+  const handleStartSync = async (): Promise<void> => {
+    try {
+      setError('')
+      setMessage('请选择要同步的本地文件夹…')
+      const handle = await pickDirectory()
+      const begin = await postJson('/begin', { name: handle.name })
+      const dir = String(begin.dir ?? '')
+      await syncManager.start(dir, handle)
+      const created = await ctx.workspaces.create({ path: dir })
+      ctx.workspaces.startSession(created.workspaceId)
+      setMessage(`已开始后台双向同步：${handle.name}`)
+    } catch (syncError) {
+      setError(syncError instanceof Error ? syncError.message : String(syncError))
+      setMessage('')
+    }
+  }
+
+  const handleStopSync = async (): Promise<void> => {
+    await syncManager.stop()
+    setMessage('已停止后台同步')
+  }
+
+  const handleSyncNow = async (): Promise<void> => {
+    await syncManager.syncNow()
+  }
+
+  const handleForgetSync = async (): Promise<void> => {
+    if (!window.confirm('忘记此文件夹的同步状态并停止同步？')) return
+    await syncManager.forget()
+    setMessage('已停止并清除同步状态')
+  }
+
   const cancel = (): void => {
-    xhrRef.current?.abort()
+    xhrsRef.current?.forEach(xhr => xhr.abort())
+    xhrsRef.current?.clear()
   }
 
   const download = (): void => {
     if (status?.cwd === null || status?.cwd === undefined) return
+    setError('')
     setMessage('正在打包下载…')
     fetch(`${API}/download?dir=${encodeURIComponent(status.cwd)}`)
       .then(async response => {
@@ -263,6 +339,7 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
   const remove = (): void => {
     if (status?.cwd === null || status?.cwd === undefined) return
     if (!window.confirm(`删除服务器上的工作区目录 ${status.cwd}？\n（工作区注册与会话不受影响）`)) return
+    setError('')
     setBusy(true)
     postJson('/remove', { dir: status.cwd })
       .then(() => {
@@ -287,6 +364,7 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
       : sessionId === undefined
         ? '当前没有打开的会话——上传完成后会自动创建新会话'
         : '把电脑上的文件夹传上来，作为本会话的工作区'
+  const syncSupported = isDirectoryPickerSupported()
 
   return (
     <Modal
@@ -315,6 +393,58 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
             </span>
           )}
         </div>
+
+        {syncSupported ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 10, borderRadius: 8, background: 'var(--dsw-alias-interactive-bg-hover)' }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' }}>后台双向同步</div>
+            {syncSnapshot.running ? (
+              <>
+                <div style={{ fontSize: 13, color: 'var(--dsw-alias-label-primary)' }}>
+                  正在同步「{syncSnapshot.handleName}」{syncSnapshot.syncing ? '…' : ''}
+                </div>
+                {syncSnapshot.lastSyncAt !== null && (
+                  <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>
+                    上次同步：{new Date(syncSnapshot.lastSyncAt).toLocaleTimeString()}
+                  </div>
+                )}
+                {syncSnapshot.lastStats !== null && (
+                  <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>
+                    最近一次：上传 {syncSnapshot.lastStats.uploaded} · 下载 {syncSnapshot.lastStats.downloaded} · 本地删 {syncSnapshot.lastStats.deletedLocal} · 远端删 {syncSnapshot.lastStats.deletedRemote}
+                  </div>
+                )}
+                {syncSnapshot.lastError !== null && (
+                  <div style={{ fontSize: 12, color: 'var(--dsw-alias-state-danger-label, #e5534b)' }}>
+                    {syncSnapshot.lastError}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <Button variant="outline" size="sm" onClick={() => void handleSyncNow()} disabled={syncSnapshot.syncing}>
+                    立即同步
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => void handleStopSync()} disabled={syncSnapshot.syncing}>
+                    停止同步
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => void handleForgetSync()} disabled={syncSnapshot.syncing}>
+                    忘记文件夹
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>
+                  选择本地文件夹后，将在后台持续双向同步（含删除），关闭弹窗后仍继续。
+                </div>
+                <Button variant="outline" size="sm" onClick={() => void handleStartSync()} disabled={busy}>
+                  选择文件夹并开始同步
+                </Button>
+              </>
+            )}
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }}>
+            当前浏览器不支持后台双向同步，仍可使用一次性上传。
+          </div>
+        )}
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Button variant="primary" size="md" icon={<IconFolderOpenOutline16 />} onClick={() => inputRef.current?.click()} disabled={busy}>
@@ -393,6 +523,9 @@ function LocalWorkspaceOverlay(ctx: ClientContext, props: OverlayProps): React.R
 export function apply(ctx: ClientContext): void {
   // 共享 store 句柄：侧边栏按钮与弹层条目用同一实例（open 开关互通）。
   const store = createLocalWorkspaceStore()
+
+  // 恢复上次已授权的后台同步会话（无用户手势时仅恢复已授权句柄）。
+  void syncManager.restore().catch(() => { /* 恢复失败不影响插件其他功能 */ })
 
   ctx.effect(() => ctx.slots.inject('sidebar.footer.action', () =>
     ctx.slots.register(

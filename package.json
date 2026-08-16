@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-local-workspace",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "本地文件夹工作区桥：浏览器选本地文件夹→上传到服务器工作区→会话 cwd 指向该目录（zip 打包下载/删除）",
   "private": true,
   "type": "module",
@@ -25,7 +25,8 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "build:client": "tsdown"
+    "build:client": "tsdown",
+    "test": "npm run build && node --test tests/*.test.mjs"
   },
   "exports": {
     ".": {
