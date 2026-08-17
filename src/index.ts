@@ -46,6 +46,8 @@ export interface Config {
   maxTotalBytes: number
   /** 单个工作区目录条目（文件数）上限。 */
   maxFiles: number
+  /** 服务器目录选择方式：native 用官方原生选择器；browse 用内置浏览；tryNativeFirst 先原生、失败回退浏览。 */
+  serverDirectoryMode: 'native' | 'browse' | 'tryNativeFirst'
 }
 
 export const Config = z.object({
@@ -53,6 +55,11 @@ export const Config = z.object({
   maxFileBytes: z.number().min(1024 * 1024).default(256 * 1024 * 1024),
   maxTotalBytes: z.number().min(1024 * 1024).default(1024 * 1024 * 1024),
   maxFiles: z.natural().min(1).default(20000),
+  serverDirectoryMode: z.union([
+    z.const('native'),
+    z.const('browse'),
+    z.const('tryNativeFirst'),
+  ]).default('browse'),
 })
 
 /** 上传工作区目录的实时统计（用于上传时即时限流，避免 commit 阶段才失败）。 */

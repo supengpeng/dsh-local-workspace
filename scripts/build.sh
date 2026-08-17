@@ -54,6 +54,13 @@ link_pkg @types/react node_modules/.pnpm/@types+react@18.3.31/node_modules/@type
 # client 侧类型（platform 模块，运行时经 loader 模块表解析）
 link_pkg @deepseek-ai/dsh-client-runtime packages/client/runtime
 link_pkg @deepseek-ai/dsh-client-ui-primitives packages/client/ui-primitives
+link_pkg @deepseek-ai/dsh-client-ui-workspace packages/client/ui-workspace
+link_pkg @deepseek-ai/dsh-client-ui-directory-picker-browse packages/client/ui-directory-picker-browse
+# 官方 DirectoryBrowser 的构建依赖（CSS Modules + clsx + lightningcss）
+link_pkg clsx node_modules/.pnpm/clsx@2.1.1/node_modules/clsx
+link_pkg lightningcss node_modules/.pnpm/lightningcss@1.32.0/node_modules/lightningcss
+link_pkg lightningcss-linux-x64-gnu node_modules/.pnpm/lightningcss-linux-x64-gnu@1.32.0/node_modules/lightningcss-linux-x64-gnu
+link_pkg detect-libc node_modules/.pnpm/detect-libc@2.1.2/node_modules/detect-libc
 
 STD_SCHEMA=$(find "$CHECKOUT/node_modules/.pnpm" -maxdepth 1 -type d -iname '@standard-schema+spec@*' 2>/dev/null | head -1)
 if [ -n "$STD_SCHEMA" ]; then

@@ -8,9 +8,27 @@
  */
 const API = '/local-workspace/api'
 const SYNC_INTERVAL_MS = 30000
+const SYNC_CONCURRENCY = 4
 const DB_NAME = 'dsh-local-workspace-sync'
 const DB_STORE = 'sync-state'
 const DB_VERSION = 1
+
+/** 有界并发执行异步任务，避免大量文件同步时串行等待。 */
+async function runWithConcurrency<T>(
+  items: readonly T[],
+  worker: (item: T) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  let next = 0
+  const run = async (): Promise<void> => {
+    while (next < items.length) {
+      const current = next++
+      await worker(items[current]!)
+    }
+  }
+  const count = Math.min(concurrency, items.length)
+  await Promise.all(Array.from({ length: count }, () => run()))
+}
 
 /** 清单中的单个文件。 */
 export interface SyncFile {
@@ -61,10 +79,16 @@ export function isDirectoryPickerSupported(): boolean {
   return typeof (window as DirectoryPickerWindow).showDirectoryPicker === 'function'
 }
 
-export async function pickDirectory(): Promise<FileSystemDirectoryHandle> {
+export async function pickDirectory(): Promise<FileSystemDirectoryHandle | null> {
   const picker = (window as DirectoryPickerWindow).showDirectoryPicker
   if (!picker) throw new Error('当前浏览器不支持文件夹句柄（需要 Chrome/Edge 等）')
-  return picker({ mode: 'readwrite' })
+  try {
+    return await picker({ mode: 'readwrite' })
+  } catch (error) {
+    // 用户取消选择器不是错误，静默返回 null。
+    if (error instanceof Error && error.name === 'AbortError') return null
+    throw error
+  }
 }
 
 // ─── IndexedDB 持久化 ────────────────────────────────────────────────────────
@@ -339,12 +363,14 @@ class SyncManager {
     try {
       const originalState = this.state
       const { dir, handle, baseline } = originalState
-      const remoteMap = await fetchRemoteManifest(dir)
-      const localMap = await collectLocalFiles(handle)
+      const [remoteMap, localMap] = await Promise.all([
+        fetchRemoteManifest(dir),
+        collectLocalFiles(handle),
+      ])
       const nextBaseline: SyncBaseline = { ...baseline }
       const rels = new Set([...localMap.keys(), ...remoteMap.keys(), ...Object.keys(baseline)])
 
-      for (const rel of rels) {
+      const processRel = async (rel: string): Promise<void> => {
         const local = localMap.get(rel)
         const remote = remoteMap.get(rel)
         const base = nextBaseline[rel]
@@ -411,6 +437,9 @@ class SyncManager {
           delete nextBaseline[rel]
         }
       }
+
+      await runWithConcurrency([...rels], processRel, SYNC_CONCURRENCY)
+
 
       if (!this.running || this.state !== originalState) return
       this.state = { ...originalState, baseline: nextBaseline }
