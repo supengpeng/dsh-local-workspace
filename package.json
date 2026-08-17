@@ -9,7 +9,8 @@
   "files": [
     "lib",
     "scripts",
-    "README.md"
+    "README.md",
+    "official-ui-workspace.patch"
   ],
   "license": "BSD-3-Clause",
   "peerDependencies": {

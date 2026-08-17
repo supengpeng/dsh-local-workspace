@@ -15,7 +15,7 @@ Harness（GUI 服务器）跑在远程/容器里，你的文件在你自己的�
 
 ## 使用
 
-刷新 GUI 后，**官方 WorkspaceBrowser 头部**会出现「本地文件夹」按钮：
+刷新 GUI 后，**官方 WorkspaceBrowser 头部**会出现「本地文件夹」按钮；如果未安装官方补丁，则按钮会出现在**侧边栏底部**：
 
 - 点击打开「本地文件夹工作区」弹层：
   - **一次性上传**：点「选择本地文件夹」，浏览器弹出文件夹选择器（`<input webkitdirectory>`），整个文件夹并发上传到服务器，带总进度条与取消；
@@ -27,6 +27,40 @@ Harness（GUI 服务器）跑在远程/容器里，你的文件在你自己的�
 
 - **选择本机文件夹**：上传到服务器后交给官方 `workspaces.create` 注册；
 - **选择服务器目录**：默认使用官方 DirectoryBrowser 目录浏览 UI。
+
+## 官方 WorkspaceBrowser 头部按钮（可选补丁）
+
+「本地文件夹」按钮默认显示在**官方 WorkspaceBrowser 头部**。这需要在
+`@deepseek-ai/dsh-client-ui-workspace` 中新增一个槽位：
+
+- 槽位名：`sidebar.workspaces.localWorkspaceAction`
+- 涉及文件：
+  - `packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx`
+  - `packages/client/ui-workspace/src/client/contract/slots.ts`
+  - `packages/client/ui-workspace/src/client/index.ts`
+
+仓库内已提供补丁文件：
+
+```bash
+# 在 deepseek-harness 仓库根目录执行
+git apply /path/to/dsh-local-workspace/official-ui-workspace.patch
+
+# 重新构建官方客户端包
+pnpm --filter @deepseek-ai/dsh-client-ui-workspace bundle
+```
+
+### 不安装补丁的兼容模式
+
+如果你**不安装**上述官方补丁，插件会自动进入兼容模式：
+
+- 官方 WorkspaceBrowser 头部按钮不会显示；
+- 插件自动回退到**侧边栏底部「本地文件夹」按钮**；
+- 管理弹层、上传、下载、删除、双向同步、官方「添加工作区」等全部功能仍然可用。
+
+因此：
+
+- 如果你或你的 AI 希望使用官方 WorkspaceBrowser 头部按钮，请先确认是否安装补丁；
+- 如果不安装，插件仍然兼容，不需要改代码。
 
 ## 后台双向同步
 
@@ -43,7 +77,8 @@ Harness（GUI 服务器）跑在远程/容器里，你的文件在你自己的�
   `mtime` 保留修改时间）、`commit`、`status`、`download`（自实现流式 zip）、
   `sync/manifest`、`sync/file`、`sync/remove-file`。
 - **客户端**（`src/client/index.tsx`）：注册
-  `sidebar.workspaces.localWorkspaceAction`（官方 WorkspaceBrowser 头部入口）与
+  `sidebar.workspaces.localWorkspaceAction`（官方 WorkspaceBrowser 头部入口），
+  未检测到该槽位时自动注册 `sidebar.footer.action`（侧边栏底部兼容入口），并注册
   `shell.overlay`（本地文件夹管理弹层），同时注册官方
   `sidebar.workspaces.directoryFlow` / `conversation.hero.workspace.directoryFlow`
   （官方「添加工作区」入口）；本机文件夹上传用官方 ui-primitives，

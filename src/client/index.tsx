@@ -66,6 +66,7 @@ interface WorkspacesFace {
 interface SlotsFace {
   inject(key: string, callback: () => unknown): unknown
   register(options: Record<string, unknown>, component: unknown): unknown
+  spec(key: string): unknown
 }
 
 type ClientContext = {
@@ -437,6 +438,31 @@ function LocalDirectoryFlow(props: LocalDirectoryFlowProps): React.ReactElement 
   )
 }
 
+
+// ─── 侧边栏底部入口（官方 WorkspaceBrowser 槽位未安装时的兼容入口）────────────
+
+/** 侧边栏 action 条目收到的 props（宽/窄栏状态 + store 座）。 */
+interface FooterActionProps {
+  wide: boolean
+  useStore: <T>(selector: (state: LocalWorkspaceState) => T) => T
+  actions: LocalWorkspaceActions
+}
+
+function LocalWorkspaceFooterAction(props: FooterActionProps): React.ReactElement {
+  const open = props.useStore(state => state.open)
+  return (
+    <Button
+      variant={open ? 'primary' : 'ghost'}
+      size="sm"
+      icon={<IconFolderOpenOutline16 />}
+      onClick={props.actions.toggle}
+      aria-label="本地文件夹工作区"
+      title="本地文件夹工作区"
+    >
+      {props.wide && '本地文件夹'}
+    </Button>
+  )
+}
 
 // ─── 官方 WorkspaceBrowser 头部本地文件夹入口 ─────────────────────────────────
 
@@ -856,9 +882,26 @@ export function apply(ctx: ClientContext, config?: ClientConfig): void {
   void syncManager.restore().catch(() => { /* 恢复失败不影响插件其他功能 */ })
 
   const serverDirectoryMode = config?.serverDirectoryMode ?? 'browse'
+  // 官方 WorkspaceBrowser 的 localWorkspaceAction 槽位需要补丁才能存在；
+  // 未安装补丁时回退到侧边栏底部按钮，保证管理面板仍然可访问。
+  const hasOfficialActionSlot = ctx.slots.spec('sidebar.workspaces.localWorkspaceAction') !== undefined
 
   // 组件定义在 apply 内：上传/切换会话需要闭包里的 ctx（workspaces 服务）。
   const Overlay = (props: OverlayProps): React.ReactElement | null => LocalWorkspaceOverlay(ctx, props, serverDirectoryMode)
+  if (!hasOfficialActionSlot) {
+    ctx.effect(() => ctx.slots.inject('sidebar.footer.action', () =>
+      ctx.slots.register(
+        {
+          name: 'sidebar.footer.action',
+          id: 'local-workspace',
+          order: 50,
+          label: () => '本地文件夹工作区',
+          store,
+        },
+        LocalWorkspaceFooterAction,
+      ),
+    ), 'local-workspace: footer action (fallback)')
+  }
   ctx.effect(() => ctx.slots.inject('shell.overlay', () =>
     ctx.slots.register(
       {
